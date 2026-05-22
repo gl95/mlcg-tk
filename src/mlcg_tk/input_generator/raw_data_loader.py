@@ -3,8 +3,9 @@ import os
 from natsort import natsorted
 from glob import glob
 import h5py
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Any
 import mdtraj as md
+from MDAnalysis.coordinates.chain import ChainReader
 import warnings
 from pathlib import Path
 from tqdm import tqdm
@@ -1549,4 +1550,101 @@ class WaterMethaneLoader(DatasetLoader):
             aa_force_list.append(force[::stride])
         aa_coords = np.concatenate(aa_coord_list)
         aa_forces = np.concatenate(aa_force_list)
+        return aa_coords, aa_forces
+
+
+class TRRLoader(DatasetLoader):
+    r"""
+    Loader for trr trajectory data.
+    """
+
+    def get_traj_top(self, name: str, pdb_fn: str):
+        pdb_path = pdb_fn.format(name)
+        pdb_files = glob(pdb_path)
+        if not pdb_files:
+            raise FileNotFoundError(f"No PDB file found at {pdb_path}")
+        pdb = md.load(pdb_files[0])
+        aa_traj = pdb
+        top_dataframe = aa_traj.topology.to_dataframe()[0]
+        return aa_traj, top_dataframe
+
+    def load_coords_forces(
+        self,
+        trajs_regexp: str,
+        name: str,
+        stride: int = 1,
+        batch: Optional[int] = None,
+        n_batches: Optional[int] = 1,
+        atom_indices: Optional[Any] = None,
+        verbose : Optional[bool] = True,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        For a given name, returns np.ndarray's of its coordinates and forces at
+        the input resolution (generally atomistic)
+
+        Parameters
+        ----------
+        trajs_regexp : str
+            Regular expression identifying the trajectories to load.
+            E.g.: data/molecule/*/run.trr, or data/molecule*.trr
+        name : str
+            Name of input sample (unused, kept for compatibility).
+        stride : int
+            Interval by which to stride loaded data
+        batch: int or None
+            If trajectories are loaded by batch, indicates the batch index to load
+            must be set if n_batches > 1
+        n_batches: int, default is 1
+            If greater than 1, divide the total trajectories to load into
+            n_batches chunks. Differently from the legacy loader, this one uses
+            MDAnalysis' ChainReader and splits the trajectories into chuncks of
+            equal frames, and not by files.
+        atom_indices: default is None
+            If not None, take trajectory subset corresponding to atom_indices.
+            Useful for removing solvent.
+        verbose : bool, default True
+            It True, show progress bar when loading.
+        """
+
+        # look for trr files
+        filenames = np.array(natsorted(glob(trajs_regexp)))
+
+        # load MDAnalysis *concatenated* trajectory object
+        # (don't worry, this is just a reader object, it won't fill
+        # up your memory regardless of the size on disk)
+        trajectory = ChainReader(filenames)
+        nframes = len(trajectory)
+
+        # extract batch (divide by frames, not by trajectory names!)
+        if n_batches > 1:
+            assert batch is not None, "batch id must be set if more than 1 batch"
+            # ensure only frame_index % stride == 0 frames are selected:
+            # begin, end must all be multiples of stride
+            begin, end = stride * np.linspace(
+                0, np.ceil(nframes / stride), n_batches + 1, dtype=int
+                )[batch:batch + 2]
+            trajectory = trajectory[begin:end:stride]
+            nframes = len(trajectory)  # updated number of frames
+        
+        # initialize arrays
+        natoms = np.arange(trajectory.trajectory.n_atoms)[atom_indices].size
+        aa_coords = np.zeros((nframes, natoms, 3))
+        aa_forces = np.zeros((nframes, natoms, 3))
+        
+        # load forces and coordinates to memory
+        for i, ts in tqdm(
+            enumerate(trajectory),
+            total=nframes,
+            desc='loading trajs',
+            unit='frames',
+            disable=not verbose
+            ):
+            positions = ts.positions
+            forces = ts.forces
+            if atom_indices is not None:
+                positions = positions[atom_indices]
+                forces = forces[atom_indices]
+            aa_coords[i] = positions
+            aa_forces[i] = forces / 4.184  # kJ/mol/A -> kCal/mol/A
+        
         return aa_coords, aa_forces
