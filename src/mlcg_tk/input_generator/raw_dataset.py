@@ -15,6 +15,8 @@ from torch_geometric.data.collate import collate
 from mlcg.neighbor_list.neighbor_list import make_neighbor_list
 from mlcg.data.atomic_data import AtomicData
 
+from scipy.sparse import csr_array, load_npz, save_npz
+
 from .utils import (
     map_cg_topology,
     filter_cis_frames,
@@ -256,7 +258,7 @@ class SampleCollection:
         if not all([row.tolist().count(1) == 1 for row in cg_map]):
             warnings.warn("WARNING: Slice mapping matrix is not linear.")
 
-        self.cg_map = cg_map
+        self.cg_map = csr_array(cg_map)
 
         # save N_term and C_term as None, to be overwritten if terminal embeddings used
         self.N_term = None
@@ -479,16 +481,16 @@ class SampleCollection:
 
         if save_cg_maps:
             if hasattr(self, "cg_map") and self.cg_map is not None:
-                np.save(f"{mol_save_templ}cg_coord_map.npy", self.cg_map.toarray())
+                save_npz(f"{mol_save_templ}cg_coord_map.npz", csr_array(self.cg_map))
             else:
                 warnings.warn("No cg coordinate map found. Skipping save.")
 
             if hasattr(self, "force_map") and self.force_map is not None:
-                np.save(f"{mol_save_templ}cg_force_map.npy", self.force_map.toarray())
+                save_npz(f"{mol_save_templ}cg_force_map.npz", csr_array(self.force_map))
             else:
                 warnings.warn("No cg force map found. Skipping save.")
 
-    def load_cg_force_map(self, save_dir: str) -> np.ndarray:
+    def load_cg_force_map(self, save_dir: str):
         """
         Helper function to load a previously saved force map for the molecule in the sample
 
@@ -499,13 +501,25 @@ class SampleCollection:
 
         Returns:
         --------
-        force_map: np.ndarray
-            force map corresponding to the molecule in self
+        force_map:
+            Sparse force map corresponding to the molecule in self
         """
         map_save_templ = os.path.join(
             save_dir, get_output_tag([self.tag, self.mol_name], placement="before")
         )
-        force_map = np.load(f"{map_save_templ}cg_force_map.npy")
+        npz_path = f"{map_save_templ}cg_force_map.npz"
+        npy_path = f"{map_save_templ}cg_force_map.npy"
+        if os.path.isfile(npz_path):
+            force_map = load_npz(npz_path)
+        elif os.path.isfile(npy_path):
+            warnings.warn(
+                "Loaded legacy dense cg_force_map.npy; converting to sparse for compatibility."
+            )
+            force_map = csr_array(np.load(npy_path))
+        else:
+            raise FileNotFoundError(
+                f"No force map file found at {npz_path} or {npy_path}."
+            )
         return force_map
 
     def get_prior_nls(
