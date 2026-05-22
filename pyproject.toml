@@ -24,6 +24,7 @@ dependencies = [
     "h5py>=3.15.1",
     "jsonargparse>=4.42.0",
     "matplotlib>=3.10.7",
+    "mdanalysis>=2.10.0",
     "mdtraj>=1.11.0",
     "mlcg",
     "natsort>=8.4.0",
