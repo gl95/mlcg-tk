@@ -2,18 +2,25 @@ import mdtraj as md
 import pickle
 import pandas as pd
 
-from typing import List, Dict, Tuple, Optional, Union, Type
+from typing import List, Dict, Tuple, Optional, Union, Type, Any
 from copy import deepcopy
+from glob import glob
+from pathlib import Path
 import numpy as np
 import mdtraj as md
 import torch
 import warnings
 import os
+import shutil
+import MDAnalysis as mda
+from MDAnalysis.coordinates.chain import ChainReader
 
 from torch_geometric.data.collate import collate
 
 from mlcg.neighbor_list.neighbor_list import make_neighbor_list
 from mlcg.data.atomic_data import AtomicData
+
+from .embedding_maps import CGEmbeddingMapMartini, embedding_martini
 
 from scipy.sparse import csr_array, load_npz, save_npz
 
@@ -24,6 +31,7 @@ from .utils import (
     get_terminal_atoms,
     get_edges_and_orders,
     get_output_tag,
+    DataIterable
 )
 from .prior_gen import PriorBuilder
 
@@ -323,8 +331,8 @@ class SampleCollection:
 
     def process_coords_forces(
         self,
-        coords: np.ndarray,
-        forces: np.ndarray,
+        coords: Union[np.ndarray, DataIterable],
+        forces: Union[np.ndarray, DataIterable],
         topology: md.Topology,
         mapping: str = "slice_aggregate",
         filter_cis: bool = False,
@@ -399,7 +407,56 @@ class SampleCollection:
             self.cg_forces = cg_forces
 
             return cg_coords, cg_forces
+    
+    def get_save_templates(
+        self,
+        save_dir: str,
+        relative_paths: bool = True,
+        tags: List[List[str]] = None,
+        ):
+        """
+        Util for getting file names to save/load processed data.
 
+        Parameters
+        ----------
+        save_dir: str
+            Path of directory to which output will be saved.
+        relative_paths: bool
+            If True, `save_dir` is relative to the parent directory of
+            `samples.name`.
+        
+        Returns
+        -------
+        mol_save_templ, save_templ: str
+            Utilized for saving/loading data.
+
+        Remarks
+        -------
+        Creates save_dir if it does not exist.
+        """
+
+        # process save directory
+        path = Path(self.name)
+        if relative_paths:
+            root = path.parent
+            save_dir = root / save_dir
+        
+        # create save directory if not existing
+        if not os.path.isdir(save_dir):
+            os.makedirs(save_dir)
+        
+        # process mol_name and name
+        name = path.stem
+        mol_name = Path(self.mol_name).stem
+
+        # process tags
+        tags = get_output_tag([self.tag, mol_name], placement="before")
+        mol_save_templ = os.path.join(save_dir, tags)
+        tags = get_output_tag([self.tag, name], placement="before")
+        save_templ = os.path.join(save_dir, tags)
+        
+        return mol_save_templ, save_templ
+    
     def save_cg_output(
         self,
         save_dir: str,
@@ -407,7 +464,8 @@ class SampleCollection:
         save_cg_maps: bool = True,
         cg_coords: Union[np.ndarray, None] = None,
         cg_forces: Union[np.ndarray, None] = None,
-    ):
+        relative_paths: bool = True,
+        ):
         """
         Saves processed CG data.
 
@@ -421,33 +479,79 @@ class SampleCollection:
             CG coordinates; if None, will check whether these are saved as attribute.
         cg_forces:
             CG forces; if None, will check whether these are saved as an object attribute.
+        relative_paths: bool
+            If True, `save_dir` is relative to the parent directory of
+            `samples.name`.
         """
-        if not os.path.isdir(save_dir):
-            os.makedirs(save_dir)
+
+        mol_save_templ, save_templ = self.get_save_templates(
+            save_dir,
+            relative_paths=relative_paths
+        )
 
         if not hasattr(self, "cg_atom_indices"):
             warnings.warn("CG mapping must be applied before outputs can be saved.")
             return
 
-        mol_save_templ = os.path.join(
-            save_dir, get_output_tag([self.tag, self.mol_name], placement="before")
+        cg_xyz = (
+            cg_coords or
+            getattr(self, 'cg_coords') or
+            self.input_traj.atom_slice(self.cg_atom_indices).xyz
         )
-        save_templ = os.path.join(
-            save_dir, get_output_tag([self.tag, self.name], placement="before")
-        )
-        cg_xyz = self.input_traj.atom_slice(self.cg_atom_indices).xyz
 
-        with pd.option_context(
-            "future.no_silent_downcasting", True
-        ):  # Clean pd dataframe from <NA entries> before saving
-            self.cg_dataframe.formal_charge = self.cg_dataframe.formal_charge.fillna(0)
+        if hasattr(self.cg_dataframe, 'formal_charge'):
+            with pd.option_context(
+                "future.no_silent_downcasting", True
+            ):  # Clean pd dataframe from <NA entries> before saving
+                self.cg_dataframe.formal_charge = self.cg_dataframe.formal_charge.fillna(0)
+        
+        cg_traj = md.Trajectory(
+            cg_xyz[0] / 10.,  # Angstroms to nm
+            md.Topology.from_dataframe(self.cg_dataframe))
+        
+        # take unitcell information (convert to nm)
+        if isinstance(cg_xyz, DataIterable):
+            cg_traj.unitcell_lengths = cg_xyz.atoms.dimensions[:3].reshape(-1, 3) / 10.
+            cg_traj.unitcell_angles = cg_xyz.atoms.dimensions[-3:].reshape(-1, 3)
+        
+        cg_structure_file = f"{mol_save_templ}cg_structure.pdb"
+        cg_traj.save_pdb(cg_structure_file)
 
-        cg_traj = md.Trajectory(cg_xyz, md.Topology.from_dataframe(self.cg_dataframe))
-        cg_traj.save_pdb(f"{mol_save_templ}cg_structure.pdb")
+        # fix 4 chars residue names
+        resnames = list(self.cg_dataframe.resName)
+        with open(cg_structure_file, 'r') as file:
+            lines = []
+            for line in file:
+                if line.startswith('ATOM'):
+                    if len(resname := resnames.pop(0)) == 4:
+                        line = line[:17] + resname + ' ' + line[22:]
+                if line.startswith('TER'):  # skip lipids
+                    if len(resname) == 4:
+                        continue
+                lines.append(line)
+        with open(cg_structure_file, 'w') as file:
+            file.write(''.join(lines))
 
         embeds = np.array(self.cg_dataframe["type"].to_list())
         np.save(f"{mol_save_templ}cg_embeds.npy", embeds)
 
+        # util for saving either numpy ndarray or DataIterable
+        def save_data(
+                data,
+                suffix_if_npy='cg_coords.npy',
+                suffix_if_trr='cg_coords_forces.trr'
+            ):
+            if isinstance(data, DataIterable):
+                # the trajectory with both positions and forces is already there,
+                # so we just need to copy it
+                # NOTE it works because the input trajectory is associated with
+                # exactly one filename, although MDAnalysis trajectories can also
+                # be chained among different filenames
+                shutil.copy(self.cg_coords.trajectory.trajectory.filename,
+                            f"{save_templ}{suffix_if_trr}")
+            else:
+                np.save(f"{save_templ}{suffix_if_npy}", data)
+        
         if save_coord_force:
             if cg_coords == None:
                 if not hasattr(self, "cg_coords"):
@@ -460,10 +564,10 @@ class SampleCollection:
                             "No coordinates found; only CG structure, embeddings and loaded forces will be saved."
                         )
                     else:
-                        np.save(f"{save_templ}cg_coords.npy", self.cg_coords)
+                        save_data(self.cg_coords, 'cg_coords.npy')
             else:
-                np.save(f"{save_templ}cg_coords.npy", cg_coords)
-
+                save_data(cg_coords, 'cg_coords.npy')
+            
             if cg_forces == None:
                 if not hasattr(self, "cg_forces"):
                     warnings.warn(
@@ -475,22 +579,22 @@ class SampleCollection:
                             "No forces found;  only CG structure, embeddings, and loaded coordinates will be saved."
                         )
                     else:
-                        np.save(f"{save_templ}cg_forces.npy", self.cg_forces)
+                        save_data(self.cg_forces, 'cg_forces.npy')
             else:
-                np.save(f"{save_templ}cg_forces.npy", cg_forces)
-
+                save_data(cg_forces, 'cg_forces.npy')
+        
         if save_cg_maps:
             if hasattr(self, "cg_map") and self.cg_map is not None:
                 save_npz(f"{mol_save_templ}cg_coord_map.npz", csr_array(self.cg_map))
             else:
                 warnings.warn("No cg coordinate map found. Skipping save.")
-
+            
             if hasattr(self, "force_map") and self.force_map is not None:
                 save_npz(f"{mol_save_templ}cg_force_map.npz", csr_array(self.force_map))
             else:
                 warnings.warn("No cg force map found. Skipping save.")
 
-    def load_cg_force_map(self, save_dir: str):
+    def load_cg_force_map(self, save_dir: str, relative_paths: bool = True):
         """
         Helper function to load a previously saved force map for the molecule in the sample
 
@@ -498,14 +602,17 @@ class SampleCollection:
         -----------
         save_dir: str
             path to the directory where the force map was saved in the first batch of the molecule in the sample
+        relative_paths: bool
+            Same as in save_cg_output.
 
         Returns:
         --------
         force_map:
             Sparse force map corresponding to the molecule in self
         """
-        map_save_templ = os.path.join(
-            save_dir, get_output_tag([self.tag, self.mol_name], placement="before")
+        map_save_templ, _ = self.get_save_templates(
+            save_dir,
+            relative_paths=relative_paths
         )
         npz_path = f"{map_save_templ}cg_force_map.npz"
         npy_path = f"{map_save_templ}cg_force_map.npy"
@@ -591,20 +698,29 @@ class SampleCollection:
                     N_term=self.N_term,
                     C_term=self.C_term,
                 )
+        
+        # directly get the bonds from the cg dataframe
+        if hasattr(self.cg_dataframe, 'bonds'):
+            cg_top = md.Topology.from_dataframe(self.cg_dataframe)
+            cg_atoms = list(cg_top.atoms)
+            for i, bonds in enumerate(self.cg_dataframe.bonds):
+                for j in bonds:
+                    cg_top.add_bond(cg_atoms[i], cg_atoms[j])
 
-        # get atom groups for edges and orders for all prior terms
-        cg_top = self.input_traj.atom_slice(self.cg_atom_indices).topology
+        else:
+            # get atom groups for edges and orders for all prior terms
+            cg_top = self.input_traj.atom_slice(self.cg_atom_indices).topology
 
-        # we need to add an extra step for CA case: in this situation, the bonds
-        atoms = list(cg_top.atoms)
-        unique_atom_types = set([atom.name for atom in atoms])
-        if unique_atom_types == set(["CA"]):
-            # iterate over chains
-            for chain in cg_top.chains:
-                ch_atoms = list(chain.atoms)
-                # iterate over CA atoms in each chain and add bonds between them
-                for i, _ in enumerate(ch_atoms[:-1]):
-                    cg_top.add_bond(ch_atoms[i], ch_atoms[i + 1])
+            # we need to add an extra step for CA case: in this situation, the bonds
+            atoms = list(cg_top.atoms)
+            unique_atom_types = set([atom.name for atom in atoms])
+            if unique_atom_types == set(["CA"]):
+                # iterate over chains
+                for chain in cg_top.chains:
+                    ch_atoms = list(chain.atoms)
+                    # iterate over CA atoms in each chain and add bonds between them
+                    for i, _ in enumerate(ch_atoms[:-1]):
+                        cg_top.add_bond(ch_atoms[i], ch_atoms[i + 1])
 
         all_edges_and_orders = get_edges_and_orders(
             prior_builders,
@@ -635,7 +751,12 @@ class SampleCollection:
 
         return prior_nls
 
-    def has_saved_cg_output(self, save_dir: str, prior_tag: str = "") -> bool:
+    def has_saved_cg_output(
+        self,
+        save_dir: str,
+        prior_tag: str = "",
+        relative_paths: bool = True
+    ) -> bool:
         """
         Returns True if cg data exists for this SampleCollection
 
@@ -647,15 +768,26 @@ class SampleCollection:
             Location of saved cg data
         prior_tag:
             String identifying the specific combination of prior terms
+        relative_paths: bool
+            Same as in "save_cg_output".
 
         Returns
         -------
         True if cg output for the sample corresponding to prior_tag is present in save_dir
         False otherwise
+
+        Remarks
+        -------
+        Coordinates and forces can be saved in separate npy files, or in a
+        single trr file. In the latter case, they will be accessed with a
+        mlcg_tk.input_generator.utils.DataIterable object.
         """
-        save_templ = os.path.join(
-            save_dir, get_output_tag([self.tag, self.name], placement="before")
+        mol_save_templ, save_templ = self.get_save_templates(
+            save_dir,
+            relative_paths=relative_paths
         )
+        if os.path.isfile(f"{save_templ}cg_coords_forces.trr"):
+            return True
         if not os.path.isfile(f"{save_templ}cg_coords.npy"):
             warnings.warn(
                 f"Sample {self.name} has no saved CG coords - This entry will be skipped"
@@ -675,6 +807,7 @@ class SampleCollection:
         force_tag: str = "",
         mol_num_batches: int = 1,
         keep_batches: bool = False,
+        relative_paths: bool = True,
     ) -> bool:
         """
         Returns True if cg data exists for this SampleCollection
@@ -689,12 +822,27 @@ class SampleCollection:
             String identifying the specific combination of prior terms
         mol_num_batches : int
             number of batches in which the molecule is suposed to be saved
+        relative_paths: bool
+            Same as in "save_cg_output".
 
         Returns
         -------
         True if cg output for the sample corresponding to prior_tag is present in training_data_dir
         False otherwise
+
+        Remarks
+        -------
+        Delta forces can be saved in a npy file or a trr file. In the latter
+        case, they will be accessed with a
+        mlcg_tk.input_generator.utils.DataIterable object.
         """
+
+        mol_save_templ, save_templ = self.get_save_templates(
+            training_data_dir,
+            relative_paths=relative_paths
+        )
+        force_addendum = (force_tag + "_") if force_tag else ""
+        save_templ_forces = save_templ + force_addendum
 
         pos_names_lists = [
             [self.tag, self.name]
@@ -705,28 +853,29 @@ class SampleCollection:
             pos_names_lists = [
                 [self.tag, f"{self.mol_name}_batch_{i}"] for i in range(mol_num_batches)
             ]
-        for bat_list in pos_names_lists:
-            save_templ = os.path.join(
-                training_data_dir,
-                get_output_tag(bat_list, placement="before"),
-            )
-            save_templ_forces = os.path.join(
-                training_data_dir,
-                get_output_tag(bat_list + [force_tag], placement="before"),
-            )
-            if not os.path.isfile(f"{save_templ}cg_coords.npy"):
+        for i in range(mol_num_batches):
+            if mol_num_batches > 1 and not keep_batches:
+                save_templ = mol_save_templ + f'batch_{i}'
+                save_templ_forces = save_templ + force_addendum
+            if not (os.path.isfile(f"{save_templ}cg_coords.npy") or
+                    os.path.isfile(f"{save_templ}cg_coords_forces.trr")):
                 warnings.warn(
                     f"Sample {self.name} has missing CG coords at {save_templ} - This entry will be skipped"
                 )
                 return False
-            elif not os.path.isfile(f"{save_templ_forces}delta_forces.npy"):
+            elif not (os.path.isfile(f"{save_templ_forces}delta_forces.npy") or
+                      os.path.isfile(f"{save_templ_forces}delta_forces.trr")):
                 warnings.warn(
                     f"Sample {self.name} has missing delta forces at {save_templ_forces}- This entry will be skipped"
                 )
                 return False
         return True
 
-    def load_cg_output(self, save_dir: str, prior_tag: str = "") -> Tuple:
+    def load_cg_output(
+            self,
+            save_dir: str,
+            prior_tag: str = "",
+            relative_paths: bool = True) -> Tuple:
         """
         Loads all cg data produced by `save_cg_output` and `get_prior_nls`
 
@@ -736,24 +885,43 @@ class SampleCollection:
             Location of saved cg data
         prior_tag:
             String identifying the specific combination of prior terms
+        relative_paths: bool
+            Same as in "save_cg_output".
 
         Returns
         -------
         Tuple of np.ndarrays containing coarse grained coordinates, forces, embeddings,
         structure, and prior neighbour list
+
+        Remarks
+        -------
+        npy files take the priority over trr (the latter are loaded with DataIterable)
         """
-        mol_save_templ = os.path.join(
-            save_dir, get_output_tag([self.tag, self.mol_name], placement="before")
-        )
-        save_templ = os.path.join(
-            save_dir, get_output_tag([self.tag, self.name], placement="before")
+        mol_save_templ, save_templ = self.get_save_templates(
+            save_dir,
+            relative_paths=relative_paths
         )
         if os.path.isfile(f"{save_templ}cg_coords.npy"):
             cg_coords = np.load(f"{save_templ}cg_coords.npy")
+        elif os.path.isfile(f"{save_templ}cg_coords_forces.trr"):
+            universe = mda.Universe(f"{mol_save_templ}cg_structure.pdb",
+                                    f"{save_templ}cg_coords_forces.trr")
+            cg_coords = DataIterable(
+                universe.trajectory,
+                universe.atoms,
+                'positions')
         else:
             cg_coords = None
         if os.path.isfile(f"{save_templ}cg_forces.npy"):
             cg_forces = np.load(f"{save_templ}cg_forces.npy")
+        elif os.path.isfile(f"{save_templ}cg_coords_forces.trr"):
+            universe = mda.Universe(f"{mol_save_templ}cg_structure.pdb",
+                                    f"{save_templ}cg_coords_forces.trr")
+            cg_forces = DataIterable(
+                universe.trajectory,
+                universe.atoms,
+                'forces',
+                1/4.184)
         else:
             cg_forces = None
         cg_embeds = np.load(f"{mol_save_templ}cg_embeds.npy")
@@ -772,6 +940,7 @@ class SampleCollection:
         batch_size: int,
         stride: int,
         weights_template_fn: Optional[str],
+        relative_paths: bool = True
     ):
         """
         Loads saved CG data and splits these into batches for further processing
@@ -786,13 +955,15 @@ class SampleCollection:
             Number of frames to use in each batch
         stride:
             Integer by which to stride frames
+        relative_paths: bool
+            Same as in "save_cg_output".
 
         Returns
         -------
         Loaded CG data split into list of batches
         """
         cg_coords, cg_forces, cg_embeds, cg_pdb, cg_prior_nls = self.load_cg_output(
-            save_dir, prior_tag
+            save_dir, prior_tag, relative_paths=relative_paths
         )
         # load weights if given
         if weights_template_fn != None:
@@ -813,6 +984,7 @@ class SampleCollection:
         mol_num_batches: int = 1,
         keep_batches: bool = False,
         stride: int = 1,
+        relative_paths: bool=True
     ) -> Tuple:
         """
         Loads all cg data produced by `save_cg_output` and `get_prior_nls`
@@ -823,52 +995,166 @@ class SampleCollection:
             Location of saved cg data including delta forces
         force_tag:
             String identifying the produced delta forces
+        relative_paths: bool
+            Same as in "save_cg_output".
 
         Returns
         -------
         Tuple of np.ndarrays containing coarse grained coordinates, delta forces, and embeddings,
         """
-        mol_save_templ = os.path.join(
+        mol_save_templ, save_templ = self.get_save_templates(
             training_data_dir,
-            get_output_tag([self.tag, self.mol_name], placement="before"),
-        )
-        save_templ = os.path.join(
-            training_data_dir, get_output_tag([self.tag, self.name], placement="before")
+            relative_paths=relative_paths
         )
         cg_embeds = np.load(f"{mol_save_templ}cg_embeds.npy")
         if mol_num_batches > 1 and not keep_batches:
             cg_coords = []
             cg_forces = []
             for b in range(mol_num_batches):
-                save_templ = os.path.join(
-                    training_data_dir,
-                    get_output_tag(
-                        [self.tag, self.mol_name, f"batch_{b}"], placement="before"
-                    ),
-                )
-                save_templ_forces = os.path.join(
-                    training_data_dir,
-                    get_output_tag(
-                        [self.tag, self.mol_name, f"batch_{b}", force_tag],
-                        placement="before",
-                    ),
-                )
+                save_templ = mol_save_templ + 'batch_{b}'
+                if force_tag:
+                    save_templ_forces = mol_save_templ + force_tag + '_'
 
-                cg_coords.append(np.load(f"{save_templ}cg_coords.npy"))
-                cg_forces.append(np.load(f"{save_templ_forces}delta_forces.npy"))
+                if os.path.exists(f"{save_templ}cg_coords.npy"):
+                    cg_coords.append(np.load(f"{save_templ}cg_coords.npy"))
+                else:
+                    universe = mda.Universe(
+                        f"{mol_save_templ}cg_structure.pdb",
+                        np.load(f"{save_templ}cg_coords_forces.trr"))
+                    cg_coords.append(DataIterable(
+                        universe.trajectory, universe.atoms))
+                if os.path.exists(f"{save_templ}delta_forces.npy"):
+                    cg_forces.append(np.load(f"{save_templ}delta_forces.npy"))
+                else:
+                    universe = mda.Universe(
+                        f"{mol_save_templ}cg_structure.pdb",
+                        np.load(f"{save_templ_forces}delta_forces.trr"))
+                    cg_forces.append(DataIterable(
+                        universe.trajectory, universe.atoms))
 
-            cg_coords = np.concatenate(cg_coords)[::stride]
-            cg_forces = np.concatenate(cg_forces)[::stride]
+            if any(isinstance(cg_coords, np.ndarray) for cg_coords in cg_coords):
+                cg_coords = np.concatenate(
+                    [cg_coords[:] for cg_coords in cg_coords])[::stride]
+            else:
+                # concatenate all trajectories, then assign them to the first
+                # DataIterable, finally discard the others
+                cg_coords[0].atoms.universe.trajectory = ChainReader(
+                    [cg_coords.trajectory for cg_coords in cg_coords]
+                )[::stride]
+                cg_coords = cg_coords[0]
+                cg_coords.trajectory = cg_coords.atoms.trajectory
+            if any(isinstance(cg_forces, np.ndarray) for cg_forces in cg_forces):
+                cg_forces = np.concatenate(
+                    [cg_forces[:] for cg_forces in cg_forces])[::stride]
+            else:
+                cg_forces[0].atoms.universe.trajectory = ChainReader(
+                    [cg_forces.trajectory for cg_forces in cg_forces]
+                )[::stride]
+                cg_forces = cg_forces[0]
+                cg_forces.trajectory = cg_forces.atoms.trajectory
         else:
-            coord_file_path = f"{save_templ}cg_coords.npy"
-            cg_coords = np.load(coord_file_path)[::stride]
-            save_templ_forces = os.path.join(
-                training_data_dir,
-                get_output_tag([self.tag, self.name, force_tag], placement="before"),
-            )
-            force_file_path = f"{save_templ_forces}delta_forces.npy"
-            cg_forces = np.load(force_file_path)[::stride]
+            if os.path.exists(f"{save_templ}cg_coords.npy"):
+                cg_coords = np.load(f"{save_templ}cg_coords.npy")[::stride]
+            else:
+                universe = mda.Universe(
+                    f"{mol_save_templ}cg_coords_forces.trr",
+                    np.load(f"{save_templ_forces}delta_forces.trr"))
+                cg_coords = DataIterable(universe.trajectory, universe.atoms)
+            if force_tag:
+                save_templ_forces = mol_save_templ + force_tag + '_'
+            if os.path.exists(f"{save_templ_forces}delta_forces.npy"):
+                cg_coords = np.load(
+                    f"{save_templ_forces}delta_forces.npy")[::stride]
+            else:
+                universe = mda.Universe(
+                    f"{mol_save_templ}cg_structure.pdb",
+                    np.load(f"{save_templ_forces}delta_forces.trr"))
+                cg_coords = DataIterable(universe.trajectory, universe.atoms)
         return cg_coords, cg_forces, cg_embeds
+
+
+class MMSampleCollection(SampleCollection):
+    """
+    SampleCollection built specifically for applying Martini CG mapping.
+    "MM" stands for Martini mapping.
+    """
+
+    def apply_cg_mapping(
+        self,
+        cg_atoms: Optional[List[str]] = None,
+        embedding_function: Optional[Any] = embedding_martini,
+        embedding_dict: Optional[Any] = CGEmbeddingMapMartini(),
+        skip_residues: Optional[List[str]] = None,
+    ):
+        """
+        Applies mapping function to atomistic topology to obtain
+        Martini CG representation.
+
+        Parameters
+        ----------
+        cg_atoms: list of str, default is None
+            List of atom names to keep. If None, take all atom names.
+        embedding_function: default is embedding_maps.embedding_martini
+            Function processing self.top_dataframe and instantiating
+            self.cg_map, self.cg_dataframe.
+        embedding_dict: default is embedding_maps.MartiniEmbeddingMap().
+            It maps bead types to indices.
+        skip_residues: (Optional)
+            List of residue names to skip (can be used to skip solvent or
+            terminal caps, for example).
+            Currently, can only be used to skip all residues with given name.
+            If you want more flexibility, directly change the "select"
+            parameter in "embedding_function".
+
+            Note: you may want to replace "skip_residues" with "select"
+            altogether.
+        
+        Remark
+        ------
+        "embedding_function" is not compatible with
+        embedding_maps.embedding_fivebead and embedding_maps.embedding_ca.
+        It is intended to be used only with embedding_maps.embedding_martini3.
+        The embedding_function input parameter is kept for compatibility.
+        """
+
+        # process selection
+        select = ''
+        if skip_residues:
+            select = f'not resname {" ".join(skip_residues)}'
+        if cg_atoms:
+            if select:
+                select += ' and '
+            select += f'name {" ".join(cg_atoms)}'
+        
+        # load cg dataframe
+        if not select:
+            self.cg_dataframe = embedding_function(self.top_dataframe)
+        else:
+            self.cg_dataframe = embedding_function(
+                self.top_dataframe, select=select)
+        
+        # create map as a sparse array
+        cg_map_row_indices = np.repeat(
+            range(len(self.cg_dataframe)),
+            [len(atoms) for atoms in self.cg_dataframe.aa_map])
+        cg_map_column_indices = np.concatenate(self.cg_dataframe.aa_map)
+        cg_map_values = np.concatenate([  # normalize per row
+            np.array(aa_weights) / sum(aa_weights)
+            for aa_weights in self.cg_dataframe.aa_weights])
+        cg_map = csr_array(
+            (cg_map_values, (cg_map_row_indices, cg_map_column_indices)),
+            shape=(len(self.cg_dataframe), len(self.top_dataframe)))
+
+        # this is just for compatibility with SampleCollection.apply_cg_mapping
+        self.cg_atom_indices = np.array([aa_map[0] for aa_map in self.cg_dataframe.aa_map])
+
+        # remove empty columns on the right
+        n_atoms_to_keep = np.flatnonzero(cg_map._getnnz(axis=0))[-1] + 1
+        self.cg_map = cg_map[:, :n_atoms_to_keep]
+
+        # save N_term and C_term as None (for compatibility)
+        self.N_term = None
+        self.C_term = None
 
 
 class RawDataset:
@@ -880,7 +1166,7 @@ class RawDataset:
     dataset_name:
         Name given to dataset
     names:
-        List of sample names
+        List of sample names or regular expression (e.g. run*/run.trr)
     tag:
         Label given to all output files produced from dataset
     dataset:
@@ -890,18 +1176,22 @@ class RawDataset:
     def __init__(
         self,
         dataset_name: str,
-        names: List[str],
+        names: Union[str, List[str]],
         tag: str,
         n_batches: Optional[int] = 1,
         collection_cls: Type[SampleCollection] = SampleCollection,
     ) -> None:
         self.dataset_name = dataset_name
-        self.names = names
+        self.names = []
+        if isinstance(names, str):
+            names = [names]
+        for name in names:
+            self.names += sorted(glob(name))
         self.tag = tag
         self.dataset = []
         self.collection_cls = collection_cls
 
-        for name in names:
+        for name in self.names:
             if n_batches > 1:
                 for batch in range(n_batches):
                     data_samples = collection_cls(
@@ -923,6 +1213,13 @@ class RawDataset:
 
     def __len__(self):
         return len(self.dataset)
+    
+    def __repr__(self):
+        text = f'mlcg_tk.RawDataset {self.dataset_name!r} '
+        if self.tag:
+            text += f'(tag: {self.tag}) '
+        text += f'with {len(self)} samples'
+        return text
 
 
 class SimInput:
