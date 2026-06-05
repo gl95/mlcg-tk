@@ -1,11 +1,17 @@
 import pandas as pd
-from typing import List, Optional, Union, Tuple, Dict
+from typing import List, Optional, Union, Tuple, Dict, Literal
 import numpy as np
 import mdtraj as md
+import MDAnalysis as mda
 import warnings
-from scipy.sparse import sparray, csr_array
+from tqdm import tqdm
+from numbers import Integral
+from pathlib import Path
+from scipy.sparse import sparray, csr_array, issparse, eye
+from MDAnalysis.coordinates.TRR import TRRWriter
 from functools import wraps
 
+import aggforce  # needed for monkey-patching
 from aggforce import (
     LinearMap,
     guess_pairwise_constraints,
@@ -13,6 +19,388 @@ from aggforce import (
     constraint_aware_uni_map,
     qp_linear_map,
 )
+from aggforce.map.core import _has_nans
+
+# monkey patches to aggforce: _LinearMap supporting sparse arrays
+class _LinearMap(LinearMap):
+    def __init__(
+        self,
+        mapping : Union[List[List[int]], csr_array, np.ndarray],
+        n_fg_sites : Union[int, None]=None,
+        handle_nans : Union[bool, Literal["safe"]]=True,
+        nan_check_threshold : float=1e-6
+    ) -> None:
+        if (issparse(mapping) or isinstance(mapping, np.ndarray)
+            ) and len(mapping.shape) == 2:
+            if n_fg_sites is not None:
+                raise ValueError(
+                    "Cannot specify n_fg_sites when mapping is ArrayLike. "
+                    "Let it be inferred."
+                )
+            self._standard_matrix = mapping
+            if len(self.standard_matrix.shape) != 2:
+                raise ValueError(
+                    f"mapping ({mapping}) does not cast into a 2-d numpy array."
+            )
+        elif hasattr(mapping, "__iter__"):
+            # assume we are in the case of iterable of lists
+            if n_fg_sites is None:
+                raise ValueError()
+            mapping = list(mapping)
+            n_cg_sites = len(mapping)
+            mapping_mat = np.zeros((n_cg_sites, n_fg_sites))
+            for site, site_contents in enumerate(mapping):
+                local_map = np.zeros(n_fg_sites)
+                local_map[site_contents] = 1 / len(site_contents)
+                mapping_mat[site, :] = local_map
+            self._standard_matrix = mapping_mat
+        else:
+            raise ValueError("Cannot understanding mapping f{mapping}.")
+        #
+        self.handle_nans = handle_nans
+        if self.handle_nans:
+            if ((isinstance(self._standard_matrix, np.ndarray) and
+                not np.all(np.isfinite(self._standard_matrix))) or
+                (issparse(self._standard_matrix) and
+                not np.all(np.isfinite(self._standard_matrix.data)))):
+                raise ValueError(
+                    "Nan checking can only be performed in "
+                    "standard_matrix is itself finite."
+                )
+        self.nan_check_threshold = nan_check_threshold
+    #
+    def close_to_identity(self, threshold: float = 1e-8):
+        # had to redefine because of a bug in the original class
+        #
+        matrix = self._standard_matrix
+        internal_shape = matrix.shape
+        if internal_shape[0] != internal_shape[1]:
+            return False
+        if issparse(matrix):
+            return (abs(matrix - eye(internal_shape[0], format=matrix.format))
+                    ).max() <= threshold
+        return np.allclose(matrix, np.eye(internal_shape[0]), atol=threshold)
+    #
+    def __call__(
+            self,
+            points: np.ndarray,
+    ) -> np.ndarray:
+        # had to redefine because np.einsum does not work on sparse mat
+        #
+        # reimports/redefinitions
+        def trjdot(
+                points : np.ndarray, factor : np.ndarray
+        ) -> np.ndarray:
+            """Supports sparse arrays."""
+            if factor.ndim == 2:
+                if issparse(factor):
+                    return np.stack(
+                        [points[:, :, d] @ factor.T
+                            for d in range(points.shape[2])],
+                        axis=-1,
+                    )
+                #   
+                return np.einsum(
+                    "tfd,cf->tcd",
+                    points,
+                    factor,
+                    optimize=["einsum_path", (0, 1)],
+                )
+            #
+            if factor.ndim == 3:
+                if issparse(factor):
+                    raise ValueError(
+                        "Sparse factor matrices are only supported for "
+                        "time-independent mappings (factor.ndim == 2)."
+                    )
+                #
+                return np.einsum(
+                    "...fd,...cf->...cd",
+                    points,
+                    factor,
+                    optimize=["einsum_path", (0, 1)],
+                )
+            #
+            raise ValueError(
+                f"Factor matrix has incompatible shape {factor.shape}."
+            )
+        #
+        # from now on, the same function as aggmap.LinearMap.__call__
+        nan_handling = self.handle_nans and _has_nans(points)
+        if nan_handling:
+            input_mask = np.isnan(points)
+            if self.handle_nans == "safe":
+                input_matrix = points.copy()
+            else:
+                input_matrix = points
+            input_matrix[input_mask] = 0.0
+            raw_result = trjdot(input_matrix, self.standard_matrix)
+            input_matrix[input_mask] = -1.0
+            pushed_result = trjdot(input_matrix, self.standard_matrix)
+            if not np.allclose(
+                raw_result, pushed_result,
+                atol=self.nan_check_threshold
+            ):
+                raise ValueError(
+                    "NaN handling is on and results seem to depend on NaN "
+                    "positions in input array. Check input and standard_matrix."
+                )
+            input_matrix[input_mask] = np.nan
+            return raw_result
+        else:
+            return trjdot(points, self.standard_matrix)
+    #
+    @property
+    def T(self):
+        """LinearMap defined by transpose of its standard matrix."""
+        return self.__class__(
+            mapping=self.standard_matrix.T,
+            handle_nans=self.handle_nans,
+            nan_check_threshold=self.nan_check_threshold,
+        )
+    #
+    def __matmul__(self, lm: "LinearMap", /):
+        """LinearMap defined by multiplying the standard_matrix's of arguments."""
+        return self.__class__(
+            mapping=self.standard_matrix @ lm.standard_matrix,
+            handle_nans=self.handle_nans,
+            nan_check_threshold=self.nan_check_threshold,
+        )
+    #
+    def __rmul__(self, c: float, /):
+        """LinearMap defined by multiplying the standard_matrix's with a coefficient."""
+        return self.__class__(
+            mapping=c * self.standard_matrix,
+            handle_nans=self.handle_nans,
+            nan_check_threshold=self.nan_check_threshold,
+        )
+    #
+    def __add__(self, lm: "LinearMap", /):
+        """LinearMap defined by adding standard_matrices."""
+        return self.__class__(
+            mapping=self.standard_matrix + lm.standard_matrix,
+            handle_nans=self.handle_nans,
+            nan_check_threshold=self.nan_check_threshold,
+        )
+
+# inherit docstrings & apply patch
+_LinearMap.__doc__ = LinearMap.__doc__
+_LinearMap.close_to_identity.__doc__ = LinearMap.close_to_identity.__doc__
+_LinearMap.__init__.__doc__ = f'''{LinearMap.__init__.__doc__}
+
+Remarks
+-------
+"mapping" can also by a scipy.sparse array.'''
+_LinearMap.__call__.__doc__ = LinearMap.__call__.__doc__
+aggforce.map.LinearMap = _LinearMap
+
+# monkey patches to aggforce: immensely faster reduce_constraint_sets
+from collections import defaultdict
+def reduce_constraint_sets(constraints):
+    """Merge overlapping constraint sets into disjoint components."""
+    if len(constraints) <= 1:
+        return set(constraints)
+    #
+    parent = {}
+    #
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # path compression
+            x = parent[x]
+        return x
+    #
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+    #
+    # initialize atoms
+    for c in constraints:
+        for atom in c:
+            parent.setdefault(atom, atom)
+    #
+    # union atoms within each constraint
+    for c in constraints:
+        c = iter(c)
+        first = next(c)
+        for atom in c:
+            union(first, atom)
+    #
+    # build connected components
+    components = defaultdict(set)
+    for atom in parent:
+        components[find(atom)].add(atom)
+    #
+    return {frozenset(component) for component in components.values()}
+
+# apply patch
+aggforce.constraints.tools.reduce_constraint_sets = reduce_constraint_sets
+
+# monkey patches to aggforce: immensely faster constraint_aware_uni_map
+# which also initialize force_matrix as sparse
+ForcesTrajectory = aggforce.trajectory.ForcesTrajectory
+SeperableTMap = aggforce.map.SeperableTMap
+Constraints = aggforce.constraints.Constraints
+from itertools import product
+def constraint_aware_uni_map(
+    traj: ForcesTrajectory,  # noqa: ARG001
+    coord_map: LinearMap,
+    constraints: Union[None, Constraints] = None,
+) -> SeperableTMap:
+    if constraints is None:
+        constraints = set()
+    # get which sites have nonzero contributions to each cg site
+    cg_sets = [set(np.nonzero(row)[0]) for row in coord_map.standard_matrix]
+    #
+    constraints = aggforce.constraints.tools.reduce_constraint_sets(constraints)
+    # add atoms which are related by constraint to those already in cg sites
+    # faster implementation
+    # NOTE: I did myself, without those phony AIs
+    cache = {}
+    for group in constraints:
+        for id in group:
+            cache[id] = group
+    for group in cg_sets:
+        for id in list(group):
+            group.update(cache.get(id, {}))
+    #
+    rows = []
+    columns = []
+    # place a 1 where all original or those pulled in by constraints are
+    for cg_index, cg_contents in enumerate(cg_sets):
+        rows += [cg_index] * len(cg_contents)
+        columns += cg_contents
+    # create force array as sparse matrix
+    force_map_mat = csr_array(
+        (np.ones(len(rows)), (rows, columns)),
+        shape=coord_map.standard_matrix.shape)
+    force_map = aggforce.map.LinearMap(force_map_mat)
+    return SeperableTMap(coord_map=coord_map, force_map=force_map)
+
+# apply patch
+aggforce.qp.basicagg.constraint_aware_uni_map = constraint_aware_uni_map
+
+
+def expand_index(key, shape):
+    """
+    NumPy-like indexing expansion for arbitrary dimensions.
+
+    Parameters
+    ----------
+    key: int, slice, iterable
+        Numpy key.
+    shape: tuple
+        Array's shape: x.shape.
+
+    Returns
+    -------
+    indices: list of integer arrays
+        For each dimension, the selected indices
+    product: bool
+        If `True`, need to do the Cartesian product of indices;
+        if `False`, need to zip over the indices.
+    out_shape : tuple
+        `x[key].shape`
+    """
+    # process key
+    if not isinstance(key, tuple):
+        key = (key,)
+    #
+    # determine output shape
+    base_dim = (1,) * len(shape)
+    small_array = np.zeros(base_dim, dtype=np.int8)
+    virtual_array = np.broadcast_to(small_array, shape)
+    out_shape = virtual_array[key].shape
+    #
+    # determine indices
+    indices = []
+    shape = list(shape)
+    for k in key:
+        # new axis (does not consume shape axis)
+        if k is None:
+            continue
+        #
+        # get axis size
+        n = shape.pop(0)
+        #
+        # slice
+        if isinstance(k, slice):
+            indices.append(np.arange(*k.indices(n)))
+            continue
+        #
+        # list, tuple, range, np.ndarray
+        if isinstance(k, (list, tuple, range, np.ndarray)):
+            indices.append(np.array(k, dtype=int))
+            continue
+        #
+        # integral
+        if isinstance(k, Integral):
+            indices.append(np.array([k]))
+            continue
+        #
+        raise TypeError(f"Unsupported index type: {type(k)}")
+    #
+    # consume remaining axes if key was shorter
+    while shape:
+        indices.append(np.arange(shape.pop(0)))
+    #
+    # determine wether you need the cartsian "product"
+    product = np.prod([len(idxs) for idxs in indices]) == np.prod(out_shape)
+    #
+    return indices, product, out_shape
+
+
+class DataIterable:
+    """
+    Helper class for loading positions and forces from a MDAnalysis
+    trajectory.
+    """
+    def __init__(self,
+                 trajectory,
+                 atoms,
+                 attribute='positions',
+                 scaling=1.0,
+                 precision=np.float32):
+        self.trajectory = trajectory
+        self.atoms = atoms
+        self.attribute = attribute
+        self.scaling = scaling
+        self.precision = precision
+    def _get(self):
+        return getattr(self.atoms, self.attribute) / self.scaling
+    def __getitem__(self, key):
+        """
+        Extract data from iterable and return the result as a numpy array.
+        The same indexing as numpy applies: `self[key] = self[:][key]`,
+        where `self[:]` are the full data, which may be too large to be
+        loaded on memory. 
+        """
+        indices, product, out_shape = expand_index(key, self.shape)
+        if product:
+            temp_shape = tuple(len(idxs) for idxs in indices)
+            result = np.zeros(temp_shape, dtype=self.precision)
+            for i, frame in enumerate(indices[0]):
+                self.trajectory[frame]
+                result[i] = self._get()[indices[1]][:, indices[2]]
+        else:
+            result = np.zeros(len(indices[0]), dtype=self.precision)
+            for i, (frame, j, k) in enumerate(zip(*indices)):
+                self.trajectory[frame]
+                result[i] = self._get()[j, k]
+        return result.reshape(out_shape)
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+    def __len__(self):
+        return len(self.trajectory)
+    def __repr__(self):
+        return f'DataIterable of shape {self.shape}'
+    @property
+    def n_atoms(self):
+        return len(self.atoms)
+    @property
+    def shape(self):
+        return len(self), self.n_atoms, 3
 
 
 from .prior_gen import PriorBuilder
@@ -263,6 +651,7 @@ def slice_coord_forces(
         Numpy array of atomistic forces
     cg_map: [n_cg_atoms, n_atomistic_atoms]
         Linear map characterizing the atomistic to CG configurational map with shape.
+        The code now supports also scipy.sparse arrays as cg_map types.
     mapping:
         Mapping scheme to be used,
         Can be either a string, then must be either 'slice_aggregate' or 'slice_optimize',
@@ -281,14 +670,28 @@ def slice_coord_forces(
     """
     # Original hard coded values
     n_frames = 100  # taking only first 100 frames gives same results in ~1/15th of time
+    #                 (or even more in case "coords" is a DataIterable)
     threshold = 5e-3  # threshold for pairwise constraints
 
-    config_map = LinearMap(cg_map)
+    config_map = aggforce.map.LinearMap(cg_map)
     config_map_matrix = config_map.standard_matrix
-    n_sites = coords.shape[1]  # number of atomistic sites
 
+    # ensure the right coordinate/forces shape (useful when excluding solvent)
+    n_sites = config_map.n_fg_sites
+    if isinstance(coords, DataIterable):
+        coords.atoms = coords.atoms[:n_sites]
+    else:
+        coords = coords[:, :n_sites, :]
+    if isinstance(forces, DataIterable):
+        forces.atoms = forces.atoms[:n_sites]
+    else:
+        forces = forces[:, :n_sites, :]
+    if coords.shape[1] < n_sites:
+        raise RuntimeError(f'not enough atoms in input coords (< {n_sites})')
+    
     if atoms_batch_size is None or atoms_batch_size >= n_sites:
         # No batching: process all atoms at once
+        print('Guessing pairwise constraints...')
         constraints = guess_pairwise_constraints(coords[:n_frames], threshold=threshold)
 
     else:
@@ -299,9 +702,19 @@ def slice_coord_forces(
         ]
         constraints = set()
 
+        # extract the first n_frames as a numpy array
+        # (irrelevant when coords is a numpy array,
+        # crucial when it is a numpy iterator)
+        xyz = coords[:n_frames]
+
         # Within-batch constraints
-        for batch in batches:
-            xyz_batch = coords[:n_frames, batch, :]
+        for batch in tqdm(
+            batches,
+            desc='Guessing parwise constraints',
+            unit='atom batches',
+            position=0
+        ):
+            xyz_batch = xyz[:, batch, :]
             local_constraints = guess_pairwise_constraints(
                 xyz_batch, threshold=threshold
             )
@@ -317,11 +730,15 @@ def slice_coord_forces(
         # which scales approximately as O(1). However, computing all pairs between consecutive batches is generally still efficient.
         # This approach can also be extended to the case with no batching (for smaller molecules),
         # again assuming ordered residues, treating all molecules uniformly and eliminating the need for the atoms_batch_size parameter.
-        for i in range(len(batches) - 1):
+        for i in tqdm(range(len(batches) - 1),
+                      desc='Cross-batch constraints',
+                      unit='atom batches',
+                      position=0
+        ):
             b1 = batches[i]
             b2 = batches[i + 1]
-            xyz1 = coords[:n_frames, b1, :]
-            xyz2 = coords[:n_frames, b2, :]
+            xyz1 = xyz[:, b1, :]
+            xyz2 = xyz[:, b2, :]
             local_constraints = guess_pairwise_constraints(
                 xyz1, cross_xyz=xyz2, threshold=threshold
             )
@@ -332,6 +749,7 @@ def slice_coord_forces(
             constraints.update(global_constraints)
 
     if isinstance(mapping, str):
+        print('Calculating forces CG projection matrix...')
         if mapping == "slice_aggregate":
             method = constraint_aware_uni_map
             force_agg_results = project_forces(
@@ -365,11 +783,50 @@ def slice_coord_forces(
         )
 
     # convert to sparse arrays for better performance:
-
     config_map_matrix = csr_array(config_map_matrix)
     force_map_matrix = csr_array(force_map_matrix)
 
-    if batch_size is not None:
+    print('Projecting coordinates and forces...')
+    if isinstance(coords, DataIterable) or isinstance(forces, DataIterable):
+        # if using DataIterable objects, it is more convenient to load/write
+        # one frame at a time, since data are loaded to memory on-the-fly;
+        # we actually need just one iterable, since "coords" trajectory also
+        # contains the forces
+        data = coords if isinstance(coords, DataIterable) else forces
+
+        # initialize new (temporary) cg trajectory file
+        trr = Path(data.trajectory.trajectory.filename)
+        trr_fname = str(trr.with_name('.' + trr.stem + '_mapped.trr'))
+
+        # get atoms
+        atoms = data.atoms
+
+        # initialize output cg universe
+        n_cg_sites = config_map.n_cg_sites
+        cg_universe = mda.Universe.empty(n_atoms=n_cg_sites, trajectory=True)
+        cg_atoms = cg_universe.atoms
+        cg_ts = cg_universe.trajectory.ts
+
+        # write trajectory
+        with TRRWriter(trr_fname, n_atoms=n_cg_sites) as writer:
+            for aa_ts in tqdm(data.trajectory, position=0, unit='frames'):
+                frame_coords = atoms.positions.reshape(-1, n_sites, 3)
+                frame_forces = atoms.forces.reshape(-1, n_sites, 3) / 4.184
+                # convert forces from kJ/A/mol to kCal/A/mol
+                # reshape them such that matmul can handle them
+                cg_ts.frame += 1
+                cg_ts.time = aa_ts.time
+                cg_ts.dimensions = aa_ts.dimensions
+                cg_ts.positions = cg_matmul(config_map_matrix, frame_coords)[0]
+                cg_ts.forces = cg_matmul(force_map_matrix, frame_forces)[0]
+                writer.write(cg_atoms)
+        
+        # get mapped data iterables
+        cg_trajectory = cg_universe.load_new(trr_fname).trajectory
+        cg_coords = DataIterable(cg_trajectory, cg_atoms, 'positions')
+        cg_forces = DataIterable(cg_trajectory, cg_atoms, 'forces', 1 / 4.184)
+
+    elif batch_size is not None and coords.shape[0] > batch_size:
         cg_coords = batch_matmul(config_map_matrix, coords, batch_size=batch_size)
         cg_forces = batch_matmul(force_map_matrix, forces, batch_size=batch_size)
     else:
@@ -380,7 +837,10 @@ def slice_coord_forces(
 
 
 def filter_cis_frames(
-    coords: np.ndarray, forces: np.ndarray, topology: md.Topology, verbose: bool = True
+    coords: Union[np.ndarray, DataIterable],
+    forces: Union[np.ndarray, DataIterable],
+    topology: md.Topology,
+    verbose: bool = True
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     filters out frames containing cis-omega angles
@@ -408,9 +868,22 @@ def filter_cis_frames(
         )
 
     cis_omega_mask = np.zeros(coords.shape[0], dtype=bool)
-    md_traj = md.Trajectory(coords, topology)
+    
+    if isinstance(coords, DataIterable):
+        # compute omega values frame-by-frame with DataIterable
+        md_traj = None
+        omega_values = []
+        for i, xyz in enumerate(coords):
+            if md_traj is None:
+                md_traj = md.Trajectory(xyz, topology)
+            else:
+                md_traj.xyz = xyz
+            omega_values.append(md.compute_omega(md_traj)[0])
+    else:
 
-    omega_idx, omega_values = md.compute_omega(md_traj)
+        # compute omega values all at once
+        md_traj = md.Trajectory(coords, topology)
+        omega_idx, omega_values = md.compute_omega(md_traj)
 
     cis_omega_threshold = 1.0  # rad
     mask = np.all(np.abs(omega_values) > 1, axis=1)
@@ -678,3 +1151,60 @@ def get_dihedral_groups(
             atom_groups[label].append(np.concatenate(dihedral))
 
     return atom_groups
+
+
+def dataframe_to_mda_universe(df):
+    """Convert dataframe extracted from mdtraj topology to a mda.Universe
+    object, so to make it easier to do complex CG mappings."""
+    names = df["name"].to_numpy()
+    resnames = df["resName"].to_numpy()
+    resids = df["resSeq"].to_numpy()
+    segids = df["chainID"].to_numpy()
+    n_atoms = len(df)
+    if not n_atoms:
+        return mda.Universe.empty(n_atoms=0,
+                                  n_residues=0,
+                                  atom_resindex=[],
+                                  residue_segindex=[])
+    residue_boundaries = [0] + (np.flatnonzero(
+        np.diff(resids + segids * 1_000_000)) + 1).tolist() + [n_atoms]
+    residue_n_atoms = np.diff(residue_boundaries)
+    n_residues = len(residue_n_atoms)
+    universe = mda.Universe.empty(
+        n_atoms,
+        n_residues=n_residues,
+        n_segments=segids[-1] + 1,
+        atom_resindex=np.repeat(range(n_residues), residue_n_atoms),
+        residue_segindex=segids[residue_boundaries[:-1]],
+    )
+    universe.add_TopologyAttr("name", names)
+    universe.add_TopologyAttr("resname", resnames[residue_boundaries[:-1]])
+    universe.add_TopologyAttr("resid", resids[residue_boundaries[:-1]])
+    universe.add_TopologyAttr("segid", np.arange(segids[-1] + 1).astype(str))
+    return universe
+
+
+def add_bonds(universe):
+    """
+    Add (fake) bonds to a MDAnalysis universe to be able to make chains
+    whole when loading trajectories.
+    """
+    bonds = []
+    # what is protein?
+    is_protein = np.zeros(len(universe.atoms), dtype=bool)
+    is_protein[universe.select_atoms('protein').indices] = True
+    # step 1: proteins
+    for segment in universe.segments:
+        last_index = None
+        for residue in segment.residues:
+            indices = residue.atoms.indices
+            first_index = indices[0]
+            # with prior residue (only if protein)
+            if is_protein[first_index] and last_index is not None:
+                bonds.append([first_index, last_index])
+            # within residue
+            for index in indices[1:]:
+                bonds.append([first_index, index])
+            # update last index
+            last_index = indices[-1]
+    universe.add_bonds(bonds)

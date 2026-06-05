@@ -4,12 +4,14 @@ from natsort import natsorted
 from glob import glob
 import h5py
 from typing import Tuple, Optional, List, Any
+from collections.abc import Iterable
 import mdtraj as md
-from MDAnalysis.coordinates.chain import ChainReader
+import MDAnalysis as mda
+from MDAnalysis import transformations
 import warnings
 from pathlib import Path
 from tqdm import tqdm
-from .utils import chunker
+from .utils import chunker, DataIterable, add_bonds
 
 
 class DatasetLoader:
@@ -1558,62 +1560,73 @@ class TRRLoader(DatasetLoader):
     Loader for trr trajectory data.
     """
 
-    def get_traj_top(self, name: str, pdb_fn: str):
+    def get_traj_top(self, name: str, pdb_fn: str, keep_names : bool=True):
+        """
+        Parameters
+        ----------
+        keep_names : bool, default is True
+            If "True", do not let mdtraj "standardize" atom names.
+        """
         pdb_path = pdb_fn.format(name)
         pdb_files = glob(pdb_path)
         if not pdb_files:
             raise FileNotFoundError(f"No PDB file found at {pdb_path}")
-        pdb = md.load(pdb_files[0])
+        pdb = md.load(pdb_files[0], standard_names=not keep_names)
         aa_traj = pdb
         top_dataframe = aa_traj.topology.to_dataframe()[0]
         return aa_traj, top_dataframe
 
     def load_coords_forces(
         self,
-        trajs_regexp: str,
-        name: str,
+        pdb_filename: str,
+        trr_filename: str,
         stride: int = 1,
         batch: Optional[int] = None,
-        n_batches: Optional[int] = 1,
+        n_batches: Optional[int] = 0,
         atom_indices: Optional[Any] = None,
-        verbose : Optional[bool] = True,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[Iterable, Iterable]:
         """
         For a given name, returns np.ndarray's of its coordinates and forces at
-        the input resolution (generally atomistic)
+        the input resolution (generally atomistic). Make molecules whole.
 
         Parameters
         ----------
-        trajs_regexp : str
-            Regular expression identifying the trajectories to load.
-            E.g.: data/molecule/*/run.trr, or data/molecule*.trr
-        name : str
-            Name of input sample (unused, kept for compatibility).
+        pdb_filename : str
+            pdb file (used for making molecules whole)
+        trr_filename : str
+            trr file (containing the frames to load)
         stride : int
             Interval by which to stride loaded data
         batch: int or None
             If trajectories are loaded by batch, indicates the batch index to load
             must be set if n_batches > 1
-        n_batches: int, default is 1
-            If greater than 1, divide the total trajectories to load into
-            n_batches chunks. Differently from the legacy loader, this one uses
-            MDAnalysis' ChainReader and splits the trajectories into chuncks of
-            equal frames, and not by files.
+        n_batches: int, default is 0
+            If greater than 0, divide the loaded trajectory into chunks with
+            (at most) nbatches frames.
         atom_indices: default is None
             If not None, take trajectory subset corresponding to atom_indices.
             Useful for removing solvent.
         verbose : bool, default True
             It True, show progress bar when loading.
+        
+        Returns
+        -------
+        coords, forces: iterables over frames
+            Each iterable element is a np.ndarray of size 3N, corresponding to
+            either the coordinates or the positions of a specific frame.
+        
+        Remarks
+        -------
+        By returning iterables that initialize iterators and not directly
+        np.ndarray objects, one can handle very large trajectories without
+        filling up the memory.
         """
 
-        # look for trr files
-        filenames = np.array(natsorted(glob(trajs_regexp)))
-
-        # load MDAnalysis *concatenated* trajectory object
+        # load MDAnalysis trajectory object
         # (don't worry, this is just a reader object, it won't fill
         # up your memory regardless of the size on disk)
-        trajectory = ChainReader(filenames)
-        nframes = len(trajectory)
+        universe = mda.Universe(pdb_filename, trr_filename, refresh_offsets=True)
+        trajectory = universe.trajectory
 
         # extract batch (divide by frames, not by trajectory names!)
         if n_batches > 1:
@@ -1626,25 +1639,13 @@ class TRRLoader(DatasetLoader):
             trajectory = trajectory[begin:end:stride]
             nframes = len(trajectory)  # updated number of frames
         
-        # initialize arrays
-        natoms = np.arange(trajectory.trajectory.n_atoms)[atom_indices].size
-        aa_coords = np.zeros((nframes, natoms, 3))
-        aa_forces = np.zeros((nframes, natoms, 3))
-        
-        # load forces and coordinates to memory
-        for i, ts in tqdm(
-            enumerate(trajectory),
-            total=nframes,
-            desc='loading trajs',
-            unit='frames',
-            disable=not verbose
-            ):
-            positions = ts.positions
-            forces = ts.forces
-            if atom_indices is not None:
-                positions = positions[atom_indices]
-                forces = forces[atom_indices]
-            aa_coords[i] = positions
-            aa_forces[i] = forces / 4.184  # kJ/mol/A -> kCal/mol/A
-        
-        return aa_coords, aa_forces
+        # add bonds such that you can unwrap the trajectory
+        add_bonds(universe)
+        atoms = universe.atoms
+        if atom_indices is not None:
+            atoms = atoms[atom_indices]
+        trajectory.add_transformations(transformations.unwrap(atoms))
+
+        # return DataIterable objects
+        return (DataIterable(trajectory, atoms, 'positions'),
+                DataIterable(trajectory, atoms, 'forces', 1/4.184))
