@@ -88,11 +88,14 @@ class CGEmbeddingMapMartini(CGEmbeddingMap):
     def __init__(self, destination='martini3'):
         bead_types = {}
         bead_types[_TERMINAL_BEAD_TYPE] = len(bead_types)  # martini capped
-        for residue_mapping in _VIRTUAL_MAPPINGS['charmm36'][destination].values():
-            for bead_name in list(residue_mapping)[:-2]:
-                bead_type = residue_mapping[bead_name]['type']
-                if bead_type not in bead_types:
-                    bead_types[bead_type] = len(bead_types)
+        # TODO _VIRTUAL_MAPPINGS not loaded properly for some reason
+        # (NOTE as I wrote a tailored script that does Martini mapping on its
+        #       own, I am not updating this branch anymore...)
+        # for residue_mapping in _VIRTUAL_MAPPINGS['charmm36'][destination].values():
+        #     for bead_name in list(residue_mapping)[:-2]:
+        #         bead_type = residue_mapping[bead_name]['type']
+        #         if bead_type not in bead_types:
+        #             bead_types[bead_type] = len(bead_types)
         super().__init__(bead_types)
             
 

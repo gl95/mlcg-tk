@@ -5,6 +5,7 @@ ALA:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -17,6 +18,9 @@ ALA:
     type: TC3
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
+      HB3: 0.0
   bonds:
     - [BB, SC1]
   chain: [BB, BB]
@@ -27,6 +31,7 @@ ARG:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -39,8 +44,14 @@ ARG:
     type: SC3
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
+      HG1: 0.0
+      HG2: 0.0
       CD: 1.0
+      HD1: 0.0
+      HD2: 0.0
   SC2:
     type: SQ3p
     atoms:
@@ -64,6 +75,7 @@ ASN:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -76,6 +88,8 @@ ASN:
     type: SP5
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
       OD1: 1.0
       ND2: 1.0
@@ -91,6 +105,7 @@ ASP:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -103,9 +118,12 @@ ASP:
     type: SQ5n
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
       OD1: 1.0
       OD2: 1.0
+      HD2: 0.0
   bonds:
     - [BB, SC1]
   chain: [BB, BB]
@@ -116,6 +134,7 @@ CYS:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -128,7 +147,10 @@ CYS:
     type: TC6
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       SG: 1.0
+      HG1: 0.0
   bonds:
     - [BB, SC1]
   chain: [BB, BB]
@@ -139,6 +161,7 @@ GLN:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -151,7 +174,11 @@ GLN:
     type: P5
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
+      HG1: 0.0
+      HG2: 0.0
       CD: 1.0
       OE1: 1.0
       NE2: 1.0
@@ -167,6 +194,7 @@ GLU:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -179,10 +207,15 @@ GLU:
     type: Q5n
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
+      HG1: 0.0
+      HG2: 0.0
       CD: 1.0
       OE1: 1.0
       OE2: 1.0
+      HE2: 0.0
   bonds:
     - [BB, SC1]
   chain: [BB, BB]
@@ -193,6 +226,8 @@ GLY:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA1: 0.0
+      HA2: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -210,6 +245,7 @@ HIS:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -222,6 +258,8 @@ HIS:
     type: TC4
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
   SC2:
     type: TN6d
@@ -250,6 +288,7 @@ HSD:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -262,6 +301,8 @@ HSD:
     type: TC4
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
   SC2:
     type: TN6d
@@ -289,6 +330,7 @@ ILE:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -301,9 +343,18 @@ ILE:
     type: SC2
     atoms:
       CB: 1.0
+      HB: 0.0
       CG2: 1.0
+      HG21: 0.0
+      HG22: 0.0
+      HG23: 0.0
       CG1: 1.0
+      HG11: 0.0
+      HG12: 0.0
       CD: 1.0
+      HD1: 0.0
+      HD2: 0.0
+      HD3: 0.0
   bonds:
     - [BB, SC1]
   chain: [BB, BB]
@@ -314,6 +365,7 @@ LEU:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -326,9 +378,18 @@ LEU:
     type: SC2
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
+      HG: 0.0
       CD1: 1.0
+      HD11: 0.0
+      HD12: 0.0
+      HD13: 0.0
       CD2: 1.0
+      HD21: 0.0
+      HD22: 0.0
+      HD23: 0.0
   bonds:
     - [BB, SC1]
   chain: [BB, BB]
@@ -339,6 +400,7 @@ LYS:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -351,13 +413,24 @@ LYS:
     type: SC3
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
+      HG1: 0.0
+      HG2: 0.0
       CD: 1.0
+      HD1: 0.0
+      HD2: 0.0
   SC2:
     type: SQ4p
     atoms:
       CE: 1.0
+      HE1: 0.0
+      HE2: 0.0
       NZ: 1.0
+      HZ1: 0.0
+      HZ2: 0.0
+      HZ3: 0.0
   bonds:
     - [BB, SC1]
     - [SC1, SC2]
@@ -369,6 +442,7 @@ MET:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -381,9 +455,16 @@ MET:
     type: C6
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
+      HG1: 0.0
+      HG2: 0.0
       SD: 1.0
       CE: 1.0
+      HE1: 0.0
+      HE2: 0.0
+      HE3: 0.0
   bonds:
     - [BB, SC1]
   chain: [BB, BB]
@@ -394,6 +475,7 @@ PHE:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -443,6 +525,7 @@ PRO:
     atoms:
       N: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -455,8 +538,14 @@ PRO:
     type: SC3
     atoms:
       CD: 1.0
+      HD1: 0.0
+      HD2: 0.0
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
+      HG1: 0.0
+      HG2: 0.0
   bonds:
     - [BB, SC1]
   chain: [BB, BB]
@@ -467,6 +556,7 @@ SER:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -479,6 +569,8 @@ SER:
     type: TP1
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       OG: 1.0
       HG1: 1.0
   bonds:
@@ -491,6 +583,7 @@ THR:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -503,9 +596,13 @@ THR:
     type: SP1
     atoms:
       CB: 1.0
+      HB: 0.0
       OG1: 1.0
       HG1: 1.0
       CG2: 1.0
+      HG21: 0.0
+      HG22: 0.0
+      HG23: 0.0
   bonds:
     - [BB, SC1]
   chain: [BB, BB]
@@ -516,6 +613,7 @@ TRP:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -528,6 +626,8 @@ TRP:
     type: TC4
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
   SC2:
     type: TN6d
@@ -571,6 +671,7 @@ TYR:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -583,6 +684,8 @@ TYR:
     type: TC4
     atoms:
       CB: 1.0
+      HB1: 0.0
+      HB2: 0.0
       CG: 1.0
   SC2:
     type: TC5
@@ -618,6 +721,7 @@ VAL:
       N: 1.0
       HN: 1.0
       CA: 1.0
+      HA: 0.0
       C: 1.0
       O: 1.0
       HT1: 1.0  # terminal
@@ -630,8 +734,15 @@ VAL:
     type: SC3
     atoms:
       CB: 1.0
+      HB: 0.0
       CG1: 1.0
+      HG11: 0.0
+      HG12: 0.0
+      HG13: 0.0
       CG2: 1.0
+      HG21: 0.0
+      HG22: 0.0
+      HG23: 0.0
   bonds:
     - [BB, SC1]
   chain: [BB, BB]
@@ -641,17 +752,17 @@ POPC:
     atoms:
       N: 4.0
       C12: 3.0
-      C13: 4.0
-      C14: 4.0
-      C15: 4.0
       H12A: 3.0
       H12B: 3.0
+      C13: 4.0
       H13A: 4.0
       H13B: 4.0
       H13C: 4.0
+      C14: 4.0
       H14A: 4.0
       H14B: 4.0
       H14C: 4.0
+      C15: 4.0
       H15A: 4.0
       H15B: 4.0
       H15C: 4.0
@@ -719,44 +830,89 @@ POPC:
       H2R: 8.0
       H2S: 8.0
       C23: 12.0
+      H3R: 12.0
+      H3S: 12.0
       C24: 9.0
+      H4R: 9.0
+      H4S: 9.0
       C25: 6.0
+      H5R: 6.0
+      H5S: 6.0
       C26: 3.0
+      H6R: 3.0
+      H6S: 3.0
   D2A:
     type: C4h
     atoms:
       C24: 3.0
+      H4R: 3.0
+      H4S: 3.0
       C25: 6.0
+      H5R: 6.0
+      H5S: 6.0
       C26: 9.0
+      H6R: 9.0
+      H6S: 9.0
       C27: 12.0
+      H7R: 12.0
+      H7S: 12.0
       C28: 9.0
+      H8R: 9.0
+      H8S: 9.0
       C29: 8.0
       H91: 6.0
       C210: 4.0
       H101: 6.0
       C211: 3.0
+      H11R: 3.0
+      H11S: 3.0
   C3A:
     type: C1
     atoms:
       C28: 3.0
+      H8R: 3.0
+      H8S: 3.0
       C29: 4.0
       H91: 6.0
       C210: 8.0
       H101: 6.0
       C211: 9.0
+      H11R: 9.0
+      H11S: 9.0
       C212: 12.0
+      H12R: 12.0
+      H12S: 12.0
       C213: 9.0
+      H13R: 9.0
+      H13S: 9.0
       C214: 6.0
+      H14R: 6.0
+      H14S: 6.0
       C215: 3.0
+      H15R: 3.0
+      H15S: 3.0
   C4A:
     type: C1
     atoms:
       C213: 1.0
+      H13R: 1.0
+      H13S: 1.0
       C214: 2.0
+      H14R: 2.0
+      H14S: 2.0
       C215: 3.0
+      H15R: 3.0
+      H15S: 3.0
       C216: 4.0
+      H16R: 4.0
+      H16S: 4.0
       C217: 4.0
+      H17R: 4.0
+      H17S: 4.0
       C218: 4.0
+      H18R: 4.0
+      H18S: 4.0
+      H18T: 4.0
   C1B:
     type: SC1
     atoms:
@@ -859,3 +1015,4 @@ POPC:
     - [C2B, C3B]
     - [C3B, C4B]
   chain:
+
